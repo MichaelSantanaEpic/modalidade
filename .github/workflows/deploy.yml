@@ -1,0 +1,30 @@
+
+name: Set up MOSS-Image on Modal
+
+on:
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+      MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+      COMFY_PASSWORD: ${{ secrets.COMFY_PASSWORD }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install tiny Modal deployment client on GitHub runner
+        run: python -m pip install --upgrade modal
+      - name: Set up password on Modal
+        run: |
+          test -n "$COMFY_PASSWORD"
+          modal secret create --force moss-comfy-password "COMFY_PASSWORD=$COMFY_PASSWORD"
+      - name: Download the 3 large files on Modal CPU (never to GitHub or PC)
+        run: modal run modal_moss.py::download_models
+      - name: Deploy GPU ComfyUI App
+        run: modal deploy modal_moss.py
