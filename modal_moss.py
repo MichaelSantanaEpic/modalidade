@@ -1,11 +1,11 @@
-"""Browser-only MOSS-Image-SFT BF16 ComfyUI deployment on Modal.
+"""Browser-only ComfyUI deployment on Modal with MOSS-Image-SFT BF16 + Anima Base.
 
 Model downloads and model inference occur in Modal, never on the deployment client.
 Source assumptions: Modal web_server/Volume docs and ComfyUI v0.42.1 CLI.
-NOT live-deployed/tested against a Modal account by the author.
 """
 
 import os
+import shutil
 import socket
 import subprocess
 import time
@@ -17,12 +17,43 @@ app = modal.App("moss-image-comfyui")
 models = modal.Volume.from_name("moss-image-bf16-models", create_if_missing=True)
 userdata = modal.Volume.from_name("moss-image-comfy-data", create_if_missing=True)
 
-REPO_ID = "Comfy-Org/MOSS-Image"
-MODEL_FILES = (
-    "diffusion_models/moss_image_sft_bf16.safetensors",
-    "text_encoders/qwen3.5_9b_bf16.safetensors",
-    "vae/flux2-vae.safetensors",
+# Files to keep on the persistent Modal volume in folders that ComfyUI scans.
+DOWNLOAD_SPECS = (
+    # MOSS-Image-SFT BF16
+    {
+        "repo_id": "Comfy-Org/MOSS-Image",
+        "filename": "diffusion_models/moss_image_sft_bf16.safetensors",
+        "dest": "diffusion_models/moss_image_sft_bf16.safetensors",
+    },
+    {
+        "repo_id": "Comfy-Org/MOSS-Image",
+        "filename": "text_encoders/qwen3.5_9b_bf16.safetensors",
+        "dest": "text_encoders/qwen3.5_9b_bf16.safetensors",
+    },
+    {
+        "repo_id": "Comfy-Org/MOSS-Image",
+        "filename": "vae/flux2-vae.safetensors",
+        "dest": "vae/flux2-vae.safetensors",
+    },
+    # Anima Base v1.0 + requirements
+    {
+        "repo_id": "circlestone-labs/Anima",
+        "filename": "split_files/diffusion_models/anima-base-v1.0.safetensors",
+        "dest": "diffusion_models/anima-base-v1.0.safetensors",
+    },
+    {
+        "repo_id": "circlestone-labs/Anima",
+        "filename": "split_files/text_encoders/qwen_3_06b_base.safetensors",
+        "dest": "text_encoders/qwen_3_06b_base.safetensors",
+    },
+    {
+        "repo_id": "circlestone-labs/Anima",
+        "filename": "split_files/vae/qwen_image_vae.safetensors",
+        "dest": "vae/qwen_image_vae.safetensors",
+    },
 )
+
+REQUIRED_SUBDIRS = ("diffusion_models", "text_encoders", "vae")
 
 # This light CPU image only downloads the weights on Modal; no GPU charges.
 download_image = (
@@ -35,26 +66,37 @@ download_image = (
 @app.function(
     image=download_image,
     cpu=1,
-    memory=128,  # Minimum guaranteed RAM, NOT a hard limit.
+    memory=128,
     timeout=7200,
     volumes={"/mnt/models": models},
 )
 def download_models():
-    """One-time cloud download of all three unquantized MOSS-Image components."""
+    """One-time cloud download of MOSS + Anima model components."""
     from huggingface_hub import hf_hub_download
 
-    for item in MODEL_FILES:
-        print(f"Downloading/checking: {item}", flush=True)
-        path = Path(hf_hub_download(
-            repo_id=REPO_ID,
-            filename=item,
-            local_dir="/mnt/models",
-        ))
-        if not path.is_file() or path.stat().st_size < 1_000_000:
-            raise RuntimeError(f"Missing/incomplete downloaded component: {path}")
-        print(f"Verified file present: {path.name} ({path.stat().st_size:,} bytes)", flush=True)
+    base = Path("/mnt/models")
+    for sub in REQUIRED_SUBDIRS:
+        (base / sub).mkdir(parents=True, exist_ok=True)
+
+    for spec in DOWNLOAD_SPECS:
+        dest = base / spec["dest"]
+        print(f"Downloading/checking: {spec['repo_id']} :: {spec['filename']}", flush=True)
+        cached = Path(
+            hf_hub_download(
+                repo_id=spec["repo_id"],
+                filename=spec["filename"],
+            )
+        )
+        if not cached.is_file() or cached.stat().st_size < 1_000_000:
+            raise RuntimeError(f"Missing or incomplete cached file: {cached}")
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not dest.exists() or dest.stat().st_size != cached.stat().st_size:
+            shutil.copy2(cached, dest)
+        if not dest.is_file() or dest.stat().st_size < 1_000_000:
+            raise RuntimeError(f"Missing/incomplete copied component: {dest}")
+        print(f"Verified file present: {dest} ({dest.stat().st_size:,} bytes)", flush=True)
         models.commit()
-    print("All three files are on the persistent Modal Volume.", flush=True)
+    print("All requested files are on the persistent Modal Volume.", flush=True)
 
 
 # Image and dependencies are built on Modal, not your PC.
@@ -79,7 +121,6 @@ comfy_image = (
 
 
 def _patch_modal_userdata_routes():
-    """Make workflow saves tolerate slashes decoded by Modal's reverse proxy."""
     file = Path("/opt/ComfyUI/app/user_manager.py")
     text = file.read_text(encoding="utf8")
     substitutions = {
@@ -109,8 +150,8 @@ def _wait_for_server(port: int, proc: subprocess.Popen, seconds: int = 450):
 @app.function(
     image=comfy_image,
     gpu="L40S",
-    cpu=1,  # 1 PHYSICAL core guaranteed; Modal may allow higher actual use.
-    memory=128,  # 128 MiB request, NO hard RAM limit; actual use is billed.
+    cpu=1,
+    memory=128,
     max_containers=1,
     min_containers=0,
     scaledown_window=30,
@@ -121,21 +162,22 @@ def _wait_for_server(port: int, proc: subprocess.Popen, seconds: int = 450):
 @modal.concurrent(max_inputs=100)
 @modal.web_server(8000, startup_timeout=600)
 def comfyui():
-    """ComfyUI on loopback + nginx authenticated HTTPS/WebSocket edge."""
     if not os.environ.get("COMFY_PASSWORD"):
         raise RuntimeError("Set the COMFY_PASSWORD value in Modal secret moss-comfy-password")
+
     for sub in ("user", "input", "output"):
         (Path("/mnt/data") / sub).mkdir(parents=True, exist_ok=True)
-    for sub in ("diffusion_models", "text_encoders", "vae"):
+    for sub in REQUIRED_SUBDIRS:
         (Path("/mnt/models") / sub).mkdir(parents=True, exist_ok=True)
-    for item in MODEL_FILES:
-        if not (Path("/mnt/models") / item).is_file():
-            raise RuntimeError(f"Missing {item}; run download_models before deploying")
+    for spec in DOWNLOAD_SPECS:
+        path = Path("/mnt/models") / spec["dest"]
+        if not path.is_file():
+            raise RuntimeError(f"Missing {path}; run download_models before deploying")
 
     _patch_modal_userdata_routes()
 
-    Path("/tmp/moss_model_paths.yaml").write_text(
-        "moss_persistent:\n"
+    Path("/tmp/multi_model_paths.yaml").write_text(
+        "persistent_models:\n"
         "  base_path: /mnt/models\n"
         "  diffusion_models: diffusion_models\n"
         "  text_encoders: text_encoders\n"
@@ -143,13 +185,12 @@ def comfyui():
         encoding="utf8",
     )
 
-    # Everything saved from ComfyUI lives on Modal storage.
     proc = subprocess.Popen(
         [
             "python", "main.py",
             "--listen", "127.0.0.1", "--port", "8188",
             "--disable-auto-launch", "--fp32-vae",
-            "--extra-model-paths-config", "/tmp/moss_model_paths.yaml",
+            "--extra-model-paths-config", "/tmp/multi_model_paths.yaml",
             "--user-directory", "/mnt/data/user",
             "--input-directory", "/mnt/data/input",
             "--output-directory", "/mnt/data/output",
@@ -158,13 +199,12 @@ def comfyui():
     )
     _wait_for_server(8188, proc)
 
-    # Protect the public Modal URL with a browser-friendly password and proxy WS.
     htpasswd = subprocess.check_output(
         ["htpasswd", "-nbB", "comfy", os.environ["COMFY_PASSWORD"]],
         text=True,
     )
     Path("/tmp/comfy.htpasswd").write_text(htpasswd, encoding="utf8")
-    Path("/tmp/comfy.htpasswd").chmod(0o644)  # nginx unprivileged workers must read it
+    Path("/tmp/comfy.htpasswd").chmod(0o644)
     Path("/tmp/comfy.nginx.conf").write_text(
         """worker_processes 1;
         events { worker_connections 1024; }
@@ -173,7 +213,7 @@ def comfyui():
           server {
             listen 8000;
             server_name _;
-            auth_basic "ComfyUI - Modal";
+            auth_basic \"ComfyUI - Modal\";
             auth_basic_user_file /tmp/comfy.htpasswd;
             client_max_body_size 512m;
             location / {
@@ -182,7 +222,7 @@ def comfyui():
               proxy_set_header Host $host;
               proxy_set_header Upgrade $http_upgrade;
               proxy_set_header Connection $connection_upgrade;
-              proxy_set_header Sec-WebSocket-Extensions "";
+              proxy_set_header Sec-WebSocket-Extensions \"\";
               proxy_read_timeout 3600s;
               proxy_send_timeout 3600s;
               proxy_buffering off;
@@ -193,7 +233,5 @@ def comfyui():
         """,
         encoding="utf8",
     )
-    subprocess.Popen(
-        ["nginx", "-c", "/tmp/comfy.nginx.conf", "-g", "daemon off;"],
-    )
-    print("Authenticated MOSS-Image ComfyUI server launched.", flush=True)
+    subprocess.Popen(["nginx", "-c", "/tmp/comfy.nginx.conf", "-g", "daemon off;"])
+    print("Authenticated ComfyUI server launched with MOSS + Anima models.", flush=True)
